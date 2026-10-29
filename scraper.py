@@ -9,7 +9,7 @@ import aiohttp
 import asyncpg
 from aiohttp_socks import ProxyConnector
 
-DATABASE_URL = "postgres.jbchsqovebxpsfecevjy:kGepBVhNgInCkGlm@aws-0-sa-east-1.pooler.supabase.com"
+DATABASE_URL = "postgresql://postgres.jbchsqovebxpsfecevjy:kGepBVhNgInCkGlm@aws-0-sa-east-1.pooler.supabase.com:5432/postgres"
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1565501043855466547/I7Rl1P3jZNZE5dtgqh6P0trQBetv47ByOPwWY0xAZbYbu38Fht6beWvVc_mcKcJ13SQz"
 
 SCRAPE_INTERVAL = 1800
