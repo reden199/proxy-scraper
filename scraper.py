@@ -34,6 +34,8 @@ PERSIST_BUFFER_SIZE = 50
 CLAIM_BATCH_SIZE = 50
 CLAIM_TIMEOUT = 300
 SCRAPE_LOCK_TIMEOUT = 300
+WORKER_HARD_TIMEOUT = 30
+BATCH_HARD_TIMEOUT = 600
 
 TEST_URLS = [
     "https://api.ipify.org?format=json",
@@ -669,7 +671,7 @@ async def check_socks(addr, proto, timeout):
         finally:
             if connector is not None:
                 try:
-                    await connector.close()
+                    await asyncio.wait_for(connector.close(), timeout=2)
                 except Exception:
                     pass
     return False, 0
@@ -718,16 +720,29 @@ async def worker(session, queue, results, timeout, sem, buf, db_conn, instance_n
             return
         addr, protocol = item
         async with sem:
-            r = await verify_one(session, addr, protocol, timeout)
+            try:
+                r = await asyncio.wait_for(
+                    verify_one(session, addr, protocol, timeout),
+                    timeout=WORKER_HARD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning("worker: %s hard timeout", addr)
+                r = (addr, (False, 0))
+            except Exception as e:
+                log.warning("worker: %s exception %r", addr, e)
+                r = (addr, (False, 0))
         ok, latency = r[1]
         log.info("worker: %s ok=%s lat=%d", addr, ok, latency)
         if ok:
             await buf.add_ok(addr, latency)
-            row = await db_conn.fetchrow(
-                "SELECT notified FROM proxies WHERE addr=$1", addr)
-            if row and row["notified"] == 0:
-                await notify_discord(session, addr, protocol, latency, instance_number)
-                await mark_notified(db_conn, addr)
+            try:
+                row = await db_conn.fetchrow(
+                    "SELECT notified FROM proxies WHERE addr=$1", addr)
+                if row and row["notified"] == 0:
+                    await notify_discord(session, addr, protocol, latency, instance_number)
+                    await mark_notified(db_conn, addr)
+            except Exception as e:
+                log.warning("worker: db error for %s: %r", addr, e)
         else:
             await buf.add_fail(addr)
         results.append(r)
@@ -750,7 +765,15 @@ async def run_verification(session, addrs, timeout, db_conn, instance_number):
     for _ in range(WORKERS):
         await queue.put(None)
     log.info("run_verification: queue filled, joining")
-    await queue.join()
+    try:
+        await asyncio.wait_for(queue.join(), timeout=BATCH_HARD_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.error("run_verification: batch hard timeout, forcing cleanup")
+        for _ in range(WORKERS):
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                break
     log.info("run_verification: queue joined, gathering workers")
     await asyncio.gather(*workers, return_exceptions=True)
     log.info("run_verification: workers gathered, flushing")
