@@ -32,7 +32,6 @@ DISCORD_RATE_LIMIT_DELAY = 2.0
 PERSIST_BUFFER_SIZE = 50
 CLAIM_BATCH_SIZE = 50
 CLAIM_TIMEOUT = 300
-SCRAPE_LOCK_TIMEOUT = 300
 
 TEST_URLS = [
     "https://api.ipify.org?format=json",
@@ -267,6 +266,7 @@ log = logging.getLogger("proxy_pool")
 
 _webhook_lock = asyncio.Lock()
 _last_webhook_sent = 0.0
+_notified_addrs = set()
 
 
 class PersistBuffer:
@@ -282,6 +282,7 @@ class PersistBuffer:
             now = int(time.time())
             self.ok_buf.append((latency, now, now, addr))
             if len(self.ok_buf) >= self.size:
+                log.info("persist: flushing %d ok", len(self.ok_buf))
                 await self._flush_ok()
 
     async def add_fail(self, addr):
@@ -289,6 +290,7 @@ class PersistBuffer:
             now = int(time.time())
             self.fail_buf.append((now, addr))
             if len(self.fail_buf) >= self.size:
+                log.info("persist: flushing %d fail", len(self.fail_buf))
                 await self._flush_fail()
 
     async def _flush_ok(self):
@@ -312,7 +314,15 @@ class PersistBuffer:
 
 
 async def db_open():
-    conn = await asyncpg.connect(dsn=DATABASE_URL, statement_cache_size=0, command_timeout=60)
+    log.info("db_open: connecting")
+    try:
+        conn = await asyncpg.connect(dsn=DATABASE_URL, statement_cache_size=0, command_timeout=60)
+        log.info("db_open: connected")
+    except Exception as e:
+        log.exception("db_open: connect failed")
+        raise
+
+    log.info("db_open: creating schema")
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS proxies (
             addr TEXT PRIMARY KEY,
@@ -328,29 +338,24 @@ async def db_open():
             last_ok BIGINT,
             created BIGINT,
             claimed_until BIGINT,
-            claimed_by TEXT,
-            notified INTEGER DEFAULT 0
+            claimed_by TEXT
         )
     """)
+    log.info("db_open: table ok")
     await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS claimed_until BIGINT")
     await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS claimed_by TEXT")
-    await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 0")
+    log.info("db_open: alter ok")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_ok ON proxies(ok)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON proxies(score DESC)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_lastok ON proxies(last_ok)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_claimed ON proxies(claimed_until)")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_notified ON proxies(notified)")
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS scrape_lock (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            locked_until BIGINT
-        )
-    """)
+    log.info("db_open: indexes ok")
     return conn
 
 
 async def db_persist_batch(conn, ok_rows, fail_rows, now):
     if ok_rows:
+        log.info("persist_batch: %d ok", len(ok_rows))
         await conn.executemany(
             """UPDATE proxies
                SET ok=1,
@@ -365,6 +370,7 @@ async def db_persist_batch(conn, ok_rows, fail_rows, now):
             ok_rows,
         )
     if fail_rows:
+        log.info("persist_batch: %d fail", len(fail_rows))
         await conn.executemany(
             """UPDATE proxies
                SET ok=0,
@@ -378,20 +384,9 @@ async def db_persist_batch(conn, ok_rows, fail_rows, now):
         )
 
 
-async def try_scrape_lock(conn, timeout=SCRAPE_LOCK_TIMEOUT):
-    now = int(time.time())
-    result = await conn.fetchval("""
-        INSERT INTO scrape_lock(id, locked_until) VALUES(1, $1)
-        ON CONFLICT(id) DO UPDATE
-        SET locked_until = $1
-        WHERE scrape_lock.locked_until < $2
-        RETURNING 1
-    """, now + timeout, now)
-    return result is not None
-
-
 async def claim_batch(conn, batch_size=CLAIM_BATCH_SIZE, timeout=CLAIM_TIMEOUT):
     now = int(time.time())
+    log.info("claim_batch: requesting %d", batch_size)
     rows = await conn.fetch("""
         WITH claimed AS (
             SELECT addr FROM proxies
@@ -407,14 +402,8 @@ async def claim_batch(conn, batch_size=CLAIM_BATCH_SIZE, timeout=CLAIM_TIMEOUT):
         WHERE p.addr = claimed.addr
         RETURNING p.addr, p.protocol
     """, now, batch_size, timeout, INSTANCE_ID)
+    log.info("claim_batch: got %d", len(rows))
     return rows
-
-
-async def mark_notified(conn, addr):
-    await conn.execute(
-        "UPDATE proxies SET notified=1 WHERE addr=$1 AND notified=0",
-        addr
-    )
 
 
 def is_valid_public_ip(ip_str):
@@ -508,16 +497,22 @@ PARSERS = {
 
 async def scrape_one(session, cfg):
     try:
+        log.info("scrape_one: fetching %s", cfg["url"])
         async with session.get(cfg["url"], timeout=aiohttp.ClientTimeout(total=15)) as r:
+            log.info("scrape_one: %s status %d", cfg["url"], r.status)
             if r.status != 200:
                 return []
-            return PARSERS[cfg["parser"]](await r.text(errors="ignore"))
+            text = await r.text(errors="ignore")
+            parsed = PARSERS[cfg["parser"]](text)
+            log.info("scrape_one: %s parsed %d", cfg["url"], len(parsed))
+            return parsed
     except Exception as e:
         log.warning("scrape failed %s: %r", cfg["url"], e)
         return []
 
 
 async def scrape_all(session, db_conn):
+    log.info("scrape_all: start")
     sem = asyncio.Semaphore(MAX_SCRAPE_CONCURRENCY)
 
     async def bounded_scrape(name, cfg):
@@ -527,11 +522,13 @@ async def scrape_all(session, db_conn):
 
     tasks = [bounded_scrape(name, cfg) for name, cfg in SOURCES.items()]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("scrape_all: gathered %d results", len(results))
     rows = {}
     now = int(time.time())
 
     for res in results:
         if isinstance(res, Exception):
+            log.warning("scrape_all: exception %r", res)
             continue
         name, batch = res
         for addr, proto, src, country, anon in batch:
@@ -539,9 +536,11 @@ async def scrape_all(session, db_conn):
                 rows[addr] = (addr, proto or "http", name if src is None else src, country, anon, now)
 
     if not rows:
+        log.info("scrape_all: no rows")
         return
 
     try:
+        log.info("scrape_all: inserting %d", len(rows))
         await db_conn.executemany(
             """INSERT INTO proxies(addr, protocol, source, country, anonymity, created, last_checked)
                VALUES($1,$2,$3,$4,$5,$6,0)
@@ -552,7 +551,7 @@ async def scrape_all(session, db_conn):
                  anonymity=COALESCE(EXCLUDED.anonymity, proxies.anonymity)""",
             list(rows.values()),
         )
-        log.info("scrape: %d entries", len(rows))
+        log.info("scrape_all: inserted %d", len(rows))
     except Exception as e:
         log.error("scrape persist failed: %r", e)
 
@@ -627,7 +626,11 @@ async def verify_one(session, addr, protocol, timeout):
 
 async def notify_discord(session, addr, protocol, latency):
     global _last_webhook_sent
+    if addr in _notified_addrs:
+        return
     async with _webhook_lock:
+        if addr in _notified_addrs:
+            return
         now = time.monotonic()
         wait = DISCORD_RATE_LIMIT_DELAY - (now - _last_webhook_sent)
         if wait > 0:
@@ -636,20 +639,24 @@ async def notify_discord(session, addr, protocol, latency):
             "content": f"Proxy: `{addr}` | tipo: `{protocol}` | ping: `{latency}ms`"
         }
         try:
+            log.info("discord: sending %s", addr)
             async with session.post(
                 DISCORD_WEBHOOK, json=payload,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
+                log.info("discord: %s status %d", addr, r.status)
                 if r.status == 429:
                     retry = (await r.json()).get("retry_after", 5)
                     await asyncio.sleep(float(retry) + 0.5)
+                elif r.status in (200, 204):
+                    _notified_addrs.add(addr)
         except Exception as e:
             log.warning("discord webhook failed: %r", e)
         finally:
             _last_webhook_sent = time.monotonic()
 
 
-async def worker(session, queue, results, timeout, sem, buf, db_conn):
+async def worker(session, queue, results, timeout, sem, buf):
     while True:
         item = await queue.get()
         if item is None:
@@ -659,13 +666,10 @@ async def worker(session, queue, results, timeout, sem, buf, db_conn):
         async with sem:
             r = await verify_one(session, addr, protocol, timeout)
         ok, latency = r[1]
+        log.info("worker: %s ok=%s lat=%d", addr, ok, latency)
         if ok:
             await buf.add_ok(addr, latency)
-            row = await db_conn.fetchrow(
-                "SELECT notified FROM proxies WHERE addr=$1", addr)
-            if row and row["notified"] == 0:
-                await notify_discord(session, addr, protocol, latency)
-                await mark_notified(db_conn, addr)
+            await notify_discord(session, addr, protocol, latency)
         else:
             await buf.add_fail(addr)
         results.append(r)
@@ -673,42 +677,54 @@ async def worker(session, queue, results, timeout, sem, buf, db_conn):
 
 
 async def run_verification(session, addrs, timeout, db_conn):
+    log.info("run_verification: start with %d", len(addrs))
     queue = asyncio.Queue(maxsize=QUEUE_MAX)
     results = []
     sem = asyncio.Semaphore(WORKERS)
     buf = PersistBuffer(db_conn)
 
-    workers = [asyncio.create_task(worker(session, queue, results, timeout, sem, buf, db_conn))
+    workers = [asyncio.create_task(worker(session, queue, results, timeout, sem, buf))
                for _ in range(WORKERS)]
+    log.info("run_verification: %d workers started", len(workers))
 
     for item in addrs:
         await queue.put(item)
     for _ in range(WORKERS):
         await queue.put(None)
+    log.info("run_verification: queue filled, joining")
     await queue.join()
+    log.info("run_verification: queue joined, gathering workers")
     await asyncio.gather(*workers, return_exceptions=True)
+    log.info("run_verification: workers gathered, flushing")
     await buf.flush_all()
+    log.info("run_verification: done")
     return results
 
 
 async def reverify(session, db_conn, fast=False):
+    log.info("reverify: start (fast=%s)", fast)
     total_claimed = 0
     total_dead = 0
 
     while True:
+        log.info("reverify: claiming")
         rows = await claim_batch(db_conn)
         if not rows:
+            log.info("reverify: no more rows")
             break
 
         batch = [(r["addr"], r["protocol"]) for r in rows]
         total_claimed += len(batch)
+        log.info("reverify: got batch of %d", len(batch))
 
         timeout = FAST_TIMEOUT if fast else FULL_TIMEOUT
         results = await run_verification(session, batch, timeout, db_conn)
         dead = sum(1 for _, (ok, _) in results if not ok)
         total_dead += dead
 
-        log.info("claimed batch: %d (dead: %d)", len(batch), dead)
+        log.info("reverify: batch done, dead=%d", dead)
+
+    log.info("reverify: claimed total=%d dead total=%d", total_claimed, total_dead)
 
     if total_claimed == 0:
         return
@@ -718,6 +734,7 @@ async def reverify(session, db_conn, fast=False):
         return
 
     now = int(time.time())
+    log.info("reverify: cleaning dead")
     await db_conn.execute(
         """DELETE FROM proxies
            WHERE score <= -10 AND fail_streak >= 3
@@ -735,6 +752,7 @@ async def keep_alive_handler(request):
 
 
 async def start_http_server():
+    log.info("http: starting on port %d", PORT)
     app = web.Application()
     app.router.add_get("/keep-alive", keep_alive_handler)
     app.router.add_get("/", keep_alive_handler)
@@ -742,11 +760,14 @@ async def start_http_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("http server on port %d", PORT)
+    log.info("http: server on port %d", PORT)
 
 
 async def main():
+    log.info("main: start")
     db_conn = await db_open()
+    log.info("main: db open")
+
     connector = aiohttp.TCPConnector(
         limit=WORKERS,
         limit_per_host=0,
@@ -755,32 +776,33 @@ async def main():
     )
     try:
         await start_http_server()
+        log.info("main: http up")
 
         async with aiohttp.ClientSession(connector=connector) as session:
-            if await try_scrape_lock(db_conn):
-                await scrape_all(session, db_conn)
-            else:
-                log.info("scrape skipped: another instance holds the lock")
+            log.info("main: session created, scraping")
+            await scrape_all(session, db_conn)
+            log.info("main: scrape done")
 
             next_scrape = time.monotonic() + SCRAPE_INTERVAL
             next_fast_reverify = time.monotonic()
             next_full_reverify = time.monotonic()
 
+            log.info("main: entering loop")
             while True:
                 try:
                     now = time.monotonic()
                     if now >= next_scrape:
-                        if await try_scrape_lock(db_conn):
-                            await scrape_all(session, db_conn)
-                        else:
-                            log.info("scrape skipped: another instance holds the lock")
+                        log.info("main: interval scrape")
+                        await scrape_all(session, db_conn)
                         next_scrape = now + SCRAPE_INTERVAL
 
                     if now >= next_fast_reverify:
+                        log.info("main: fast reverify")
                         await reverify(session, db_conn, fast=True)
                         next_fast_reverify = now + FAST_REVERIFY
 
                     if now >= next_full_reverify:
+                        log.info("main: full reverify")
                         await reverify(session, db_conn, fast=False)
                         next_full_reverify = now + REVERIFY_INTERVAL
                 except Exception as e:
@@ -789,6 +811,7 @@ async def main():
                 sleep_until = min(next_scrape, next_fast_reverify, next_full_reverify)
                 await asyncio.sleep(max(0.05, sleep_until - time.monotonic()))
     finally:
+        log.info("main: closing db")
         await db_conn.close()
 
 
