@@ -36,6 +36,7 @@ CLAIM_TIMEOUT = 300
 SCRAPE_LOCK_TIMEOUT = 300
 WORKER_HARD_TIMEOUT = 30
 BATCH_HARD_TIMEOUT = 600
+RETRY_BATCH_SIZE = 5
 
 TEST_URLS = [
     "https://api.ipify.org?format=json",
@@ -350,6 +351,8 @@ async def db_open():
     await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS claimed_until BIGINT")
     await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS claimed_by TEXT")
     await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 0")
+    await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS url_index INTEGER DEFAULT 0")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_url_index ON proxies(url_index)")
     log.info("db_open: alter ok")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_ok ON proxies(ok)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON proxies(score DESC)")
@@ -419,6 +422,7 @@ async def db_persist_batch(conn, ok_rows, fail_rows, now):
                    fail_streak=0,
                    last_checked=$2,
                    last_ok=$3,
+                   url_index=0,
                    claimed_until=NULL,
                    claimed_by=NULL
                WHERE addr=$4""",
@@ -432,20 +436,21 @@ async def db_persist_batch(conn, ok_rows, fail_rows, now):
                    score=GREATEST(score - 0.5, -20.0),
                    fail_streak=fail_streak + 1,
                    last_checked=$1,
+                   url_index=url_index + 1,
                    claimed_until=NULL,
                    claimed_by=NULL
                WHERE addr=$2""",
             fail_rows,
         )
 
-
-async def claim_batch(conn, batch_size=CLAIM_BATCH_SIZE, timeout=CLAIM_TIMEOUT):
+async def claim_new_batch(conn, batch_size=CLAIM_BATCH_SIZE, timeout=CLAIM_TIMEOUT):
     now = int(time.time())
-    log.info("claim_batch: requesting %d", batch_size)
+    log.info("claim_new_batch: requesting %d", batch_size)
     rows = await conn.fetch("""
         WITH claimed AS (
             SELECT addr FROM proxies
-            WHERE (claimed_until IS NULL OR claimed_until < $1)
+            WHERE url_index = 0
+              AND (claimed_until IS NULL OR claimed_until < $1)
               AND (last_checked IS NULL OR last_checked < $1)
             LIMIT $2
             FOR UPDATE SKIP LOCKED
@@ -455,11 +460,34 @@ async def claim_batch(conn, batch_size=CLAIM_BATCH_SIZE, timeout=CLAIM_TIMEOUT):
             claimed_by = $4
         FROM claimed
         WHERE p.addr = claimed.addr
-        RETURNING p.addr, p.protocol
+        RETURNING p.addr, p.protocol, p.url_index
     """, now, batch_size, timeout, INSTANCE_ID)
-    log.info("claim_batch: got %d", len(rows))
+    log.info("claim_new_batch: got %d", len(rows))
     return rows
 
+
+async def claim_retry_batch(conn, batch_size=RETRY_BATCH_SIZE, timeout=CLAIM_TIMEOUT):
+    now = int(time.time())
+    log.info("claim_retry_batch: requesting %d", batch_size)
+    rows = await conn.fetch("""
+        WITH claimed AS (
+            SELECT addr FROM proxies
+            WHERE url_index > 0
+              AND url_index < $5
+              AND (claimed_until IS NULL OR claimed_until < $1)
+              AND (last_checked IS NULL OR last_checked < $1)
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE proxies p
+        SET claimed_until = $1 + $3,
+            claimed_by = $4
+        FROM claimed
+        WHERE p.addr = claimed.addr
+        RETURNING p.addr, p.protocol, p.url_index
+    """, now, batch_size, timeout, INSTANCE_ID, len(TEST_URLS))
+    log.info("claim_retry_batch: got %d", len(rows))
+    return rows
 
 async def mark_notified(conn, addr):
     await conn.execute(
@@ -628,60 +656,60 @@ def _extract_reported_ip(body):
     return str(reported).split(",")[0].strip()
 
 
-async def check_http(session, addr, timeout):
+async def check_http(session, addr, timeout, url_index):
+    if url_index >= len(TEST_URLS):
+        return False, 0
+    url = TEST_URLS[url_index]
     proxy_ip = addr.split(":")[0]
-    for url in TEST_URLS:
-        try:
-            t0 = time.perf_counter()
-            async with session.get(
-                url, proxy=f"http://{addr}",
+    try:
+        t0 = time.perf_counter()
+        async with session.get(
+            url, proxy=f"http://{addr}",
+            timeout=aiohttp.ClientTimeout(total=timeout, connect=min(2, timeout)),
+        ) as r:
+            if r.status != 200:
+                return False, 0
+            reported = _extract_reported_ip(await r.text())
+            if not reported or reported == proxy_ip:
+                return False, 0
+            return True, int((time.perf_counter() - t0) * 1000)
+    except Exception:
+        return False, 0
+
+async def check_socks(addr, proto, timeout, url_index):
+    if url_index >= len(TEST_URLS):
+        return False, 0
+    url = TEST_URLS[url_index]
+    proxy_ip = addr.split(":")[0]
+    connector = None
+    try:
+        t0 = time.perf_counter()
+        connector = ProxyConnector.from_url(f"{proto}://{addr}", rdns=True)
+        async with aiohttp.ClientSession(connector=connector) as sess:
+            async with sess.get(
+                url,
                 timeout=aiohttp.ClientTimeout(total=timeout, connect=min(2, timeout)),
             ) as r:
                 if r.status != 200:
-                    continue
+                    return False, 0
                 reported = _extract_reported_ip(await r.text())
                 if not reported or reported == proxy_ip:
-                    continue
+                    return False, 0
                 return True, int((time.perf_counter() - t0) * 1000)
-        except Exception:
-            continue
-    return False, 0
+    except Exception:
+        return False, 0
+    finally:
+        if connector is not None:
+            try:
+                await asyncio.wait_for(connector.close(), timeout=2)
+            except Exception:
+                pass
 
-
-async def check_socks(addr, proto, timeout):
-    proxy_ip = addr.split(":")[0]
-    for url in TEST_URLS:
-        connector = None
-        try:
-            t0 = time.perf_counter()
-            connector = ProxyConnector.from_url(f"{proto}://{addr}", rdns=True)
-            async with aiohttp.ClientSession(connector=connector) as sess:
-                async with sess.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=timeout, connect=min(2, timeout)),
-                ) as r:
-                    if r.status != 200:
-                        continue
-                    reported = _extract_reported_ip(await r.text())
-                    if not reported or reported == proxy_ip:
-                        continue
-                    return True, int((time.perf_counter() - t0) * 1000)
-        except Exception:
-            continue
-        finally:
-            if connector is not None:
-                try:
-                    await asyncio.wait_for(connector.close(), timeout=2)
-                except Exception:
-                    pass
-    return False, 0
-
-
-async def verify_one(session, addr, protocol, timeout):
+async def verify_one(session, addr, protocol, timeout, url_index):
     try:
         if protocol in ("socks4", "socks5"):
-            return addr, await check_socks(addr, protocol, timeout)
-        return addr, await check_http(session, addr, timeout)
+            return addr, await check_socks(addr, protocol, timeout, url_index)
+        return addr, await check_http(session, addr, timeout, url_index)
     except Exception:
         return addr, (False, 0)
 
@@ -718,11 +746,11 @@ async def worker(session, queue, results, timeout, sem, buf, db_conn, instance_n
         if item is None:
             queue.task_done()
             return
-        addr, protocol = item
+        addr, protocol, url_index = item
         async with sem:
             try:
                 r = await asyncio.wait_for(
-                    verify_one(session, addr, protocol, timeout),
+                    verify_one(session, addr, protocol, timeout, url_index),
                     timeout=WORKER_HARD_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -732,7 +760,7 @@ async def worker(session, queue, results, timeout, sem, buf, db_conn, instance_n
                 log.warning("worker: %s exception %r", addr, e)
                 r = (addr, (False, 0))
         ok, latency = r[1]
-        log.info("worker: %s ok=%s lat=%d", addr, ok, latency)
+        log.info("worker: %s url_index=%d ok=%s lat=%d", addr, url_index, ok, latency)
         if ok:
             await buf.add_ok(addr, latency)
             try:
@@ -788,24 +816,37 @@ async def reverify(session, db_conn, instance_number, fast=False):
     total_dead = 0
 
     while True:
-        log.info("reverify: claiming")
-        rows = await claim_batch(db_conn)
+        log.info("reverify: claiming new")
+        rows = await claim_new_batch(db_conn)
         if not rows:
-            log.info("reverify: no more rows")
+            log.info("reverify: no more new proxies")
             break
 
-        batch = [(r["addr"], r["protocol"]) for r in rows]
+        batch = [(r["addr"], r["protocol"], r["url_index"]) for r in rows]
         total_claimed += len(batch)
-        log.info("reverify: got batch of %d", len(batch))
+        log.info("reverify: got new batch of %d", len(batch))
 
         timeout = FAST_TIMEOUT if fast else FULL_TIMEOUT
         results = await run_verification(session, batch, timeout, db_conn, instance_number)
         dead = sum(1 for _, (ok, _) in results if not ok)
         total_dead += dead
+        log.info("reverify: new batch done, dead=%d", dead)
 
-        log.info("reverify: batch done, dead=%d", dead)
+    log.info("reverify: claiming retry")
+    retry_rows = await claim_retry_batch(db_conn)
+    if retry_rows:
+        batch = [(r["addr"], r["protocol"], r["url_index"]) for r in retry_rows]
+        total_claimed += len(batch)
+        log.info("reverify: got retry batch of %d", len(batch))
 
-    log.info("reverify: claimed total=%d dead total=%d", total_claimed, total_dead)
+        timeout = FAST_TIMEOUT if fast else FULL_TIMEOUT
+        results = await run_verification(session, batch, timeout, db_conn, instance_number)
+        dead = sum(1 for _, (ok, _) in results if not ok)
+        total_dead += dead
+        log.info("reverify: retry batch done, dead=%d", dead)
+    else:
+        log.info("reverify: no retry proxies")
+        log.info("reverify: claimed total=%d dead total=%d", total_claimed, total_dead)
 
     if total_claimed == 0:
         return
@@ -818,10 +859,10 @@ async def reverify(session, db_conn, instance_number, fast=False):
     log.info("reverify: cleaning dead")
     await db_conn.execute(
         """DELETE FROM proxies
-           WHERE score <= -10 AND fail_streak >= 3
-           AND created < $1
-           AND (last_ok IS NULL OR last_ok < $2)""",
-        now - 3600, now - 86400)
+           WHERE url_index >= $1
+           AND created < $2
+           AND (last_ok IS NULL OR last_ok < $3)""",
+        len(TEST_URLS), now - 3600, now - 86400)
 
     alive = await db_conn.fetchval("SELECT COUNT(*) FROM proxies WHERE ok=1")
     tot = await db_conn.fetchval("SELECT COUNT(*) FROM proxies")
