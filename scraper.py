@@ -5,12 +5,17 @@ import logging
 import os
 import re
 import time
+import uuid
 import aiohttp
 import asyncpg
+from aiohttp import web
 from aiohttp_socks import ProxyConnector
 
 DATABASE_URL = "postgresql://postgres.jbchsqovebxpsfecevjy:kGepBVhNgInCkGlm@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1565501043855466547/I7Rl1P3jZNZE5dtgqh6P0trQBetv47ByOPwWY0xAZbYbu38Fht6beWvVc_mcKcJ13SQz"
+
+INSTANCE_ID = os.environ.get("INSTANCE_ID", f"render-{uuid.uuid4().hex[:8]}")
+PORT = int(os.environ.get("PORT", 10000))
 
 SCRAPE_INTERVAL = 1800
 REVERIFY_INTERVAL = 3600
@@ -24,6 +29,10 @@ ABORT_THRESHOLD = 0.90
 WARMUP_CHECKS = 100
 MAX_SCRAPE_CONCURRENCY = 8
 DISCORD_RATE_LIMIT_DELAY = 2.0
+PERSIST_BUFFER_SIZE = 50
+CLAIM_BATCH_SIZE = 50
+CLAIM_TIMEOUT = 300
+SCRAPE_LOCK_TIMEOUT = 300
 
 TEST_URLS = [
     "https://api.ipify.org?format=json",
@@ -258,11 +267,52 @@ log = logging.getLogger("proxy_pool")
 
 _webhook_lock = asyncio.Lock()
 _last_webhook_sent = 0.0
-_notified_addrs = set()
+
+
+class PersistBuffer:
+    def __init__(self, conn, size=PERSIST_BUFFER_SIZE):
+        self.conn = conn
+        self.size = size
+        self.ok_buf = []
+        self.fail_buf = []
+        self.lock = asyncio.Lock()
+
+    async def add_ok(self, addr, latency):
+        async with self.lock:
+            now = int(time.time())
+            self.ok_buf.append((latency, now, now, addr))
+            if len(self.ok_buf) >= self.size:
+                await self._flush_ok()
+
+    async def add_fail(self, addr):
+        async with self.lock:
+            now = int(time.time())
+            self.fail_buf.append((now, addr))
+            if len(self.fail_buf) >= self.size:
+                await self._flush_fail()
+
+    async def _flush_ok(self):
+        if not self.ok_buf:
+            return
+        batch = self.ok_buf
+        self.ok_buf = []
+        await db_persist_batch(self.conn, batch, [], int(time.time()))
+
+    async def _flush_fail(self):
+        if not self.fail_buf:
+            return
+        batch = self.fail_buf
+        self.fail_buf = []
+        await db_persist_batch(self.conn, [], batch, int(time.time()))
+
+    async def flush_all(self):
+        async with self.lock:
+            await self._flush_ok()
+            await self._flush_fail()
 
 
 async def db_open():
-    conn = await asyncpg.connect(dsn=DATABASE_URL, statement_cache_size=0)
+    conn = await asyncpg.connect(dsn=DATABASE_URL, statement_cache_size=0, command_timeout=60)
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS proxies (
             addr TEXT PRIMARY KEY,
@@ -276,12 +326,26 @@ async def db_open():
             fail_streak INTEGER DEFAULT 0,
             last_checked BIGINT,
             last_ok BIGINT,
-            created BIGINT
+            created BIGINT,
+            claimed_until BIGINT,
+            claimed_by TEXT,
+            notified INTEGER DEFAULT 0
         )
     """)
+    await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS claimed_until BIGINT")
+    await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS claimed_by TEXT")
+    await conn.execute("ALTER TABLE proxies ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 0")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_ok ON proxies(ok)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON proxies(score DESC)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_lastok ON proxies(last_ok)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_claimed ON proxies(claimed_until)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_notified ON proxies(notified)")
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS scrape_lock (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            locked_until BIGINT
+        )
+    """)
     return conn
 
 
@@ -294,7 +358,9 @@ async def db_persist_batch(conn, ok_rows, fail_rows, now):
                    latency_ms=$1,
                    fail_streak=0,
                    last_checked=$2,
-                   last_ok=$3
+                   last_ok=$3,
+                   claimed_until=NULL,
+                   claimed_by=NULL
                WHERE addr=$4""",
             ok_rows,
         )
@@ -304,10 +370,51 @@ async def db_persist_batch(conn, ok_rows, fail_rows, now):
                SET ok=0,
                    score=GREATEST(score - 0.5, -20.0),
                    fail_streak=fail_streak + 1,
-                   last_checked=$1
+                   last_checked=$1,
+                   claimed_until=NULL,
+                   claimed_by=NULL
                WHERE addr=$2""",
             fail_rows,
         )
+
+
+async def try_scrape_lock(conn, timeout=SCRAPE_LOCK_TIMEOUT):
+    now = int(time.time())
+    result = await conn.fetchval("""
+        INSERT INTO scrape_lock(id, locked_until) VALUES(1, $1)
+        ON CONFLICT(id) DO UPDATE
+        SET locked_until = $1
+        WHERE scrape_lock.locked_until < $2
+        RETURNING 1
+    """, now + timeout, now)
+    return result is not None
+
+
+async def claim_batch(conn, batch_size=CLAIM_BATCH_SIZE, timeout=CLAIM_TIMEOUT):
+    now = int(time.time())
+    rows = await conn.fetch("""
+        WITH claimed AS (
+            SELECT addr FROM proxies
+            WHERE (claimed_until IS NULL OR claimed_until < $1)
+              AND (last_checked IS NULL OR last_checked < $1)
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE proxies p
+        SET claimed_until = $1 + $3,
+            claimed_by = $4
+        FROM claimed
+        WHERE p.addr = claimed.addr
+        RETURNING p.addr, p.protocol
+    """, now, batch_size, timeout, INSTANCE_ID)
+    return rows
+
+
+async def mark_notified(conn, addr):
+    await conn.execute(
+        "UPDATE proxies SET notified=1 WHERE addr=$1 AND notified=0",
+        addr
+    )
 
 
 def is_valid_public_ip(ip_str):
@@ -520,17 +627,13 @@ async def verify_one(session, addr, protocol, timeout):
 
 async def notify_discord(session, addr, protocol, latency):
     global _last_webhook_sent
-    if addr in _notified_addrs:
-        return
     async with _webhook_lock:
-        if addr in _notified_addrs:
-            return
         now = time.monotonic()
         wait = DISCORD_RATE_LIMIT_DELAY - (now - _last_webhook_sent)
         if wait > 0:
             await asyncio.sleep(wait)
         payload = {
-            "content": f"Proxy válida: `{addr}` | protocolo: `{protocol}` | latência: `{latency}ms`"
+            "content": f"Proxy: `{addr}` | tipo: `{protocol}` | ping: `{latency}ms`"
         }
         try:
             async with session.post(
@@ -540,15 +643,13 @@ async def notify_discord(session, addr, protocol, latency):
                 if r.status == 429:
                     retry = (await r.json()).get("retry_after", 5)
                     await asyncio.sleep(float(retry) + 0.5)
-                elif r.status in (200, 204):
-                    _notified_addrs.add(addr)
         except Exception as e:
             log.warning("discord webhook failed: %r", e)
         finally:
             _last_webhook_sent = time.monotonic()
 
 
-async def worker(session, queue, results, timeout, sem):
+async def worker(session, queue, results, timeout, sem, buf, db_conn):
     while True:
         item = await queue.get()
         if item is None:
@@ -559,17 +660,25 @@ async def worker(session, queue, results, timeout, sem):
             r = await verify_one(session, addr, protocol, timeout)
         ok, latency = r[1]
         if ok:
-            await notify_discord(session, addr, protocol, latency)
+            await buf.add_ok(addr, latency)
+            row = await db_conn.fetchrow(
+                "SELECT notified FROM proxies WHERE addr=$1", addr)
+            if row and row["notified"] == 0:
+                await notify_discord(session, addr, protocol, latency)
+                await mark_notified(db_conn, addr)
+        else:
+            await buf.add_fail(addr)
         results.append(r)
         queue.task_done()
 
 
-async def run_verification(session, addrs, timeout):
+async def run_verification(session, addrs, timeout, db_conn):
     queue = asyncio.Queue(maxsize=QUEUE_MAX)
     results = []
     sem = asyncio.Semaphore(WORKERS)
+    buf = PersistBuffer(db_conn)
 
-    workers = [asyncio.create_task(worker(session, queue, results, timeout, sem))
+    workers = [asyncio.create_task(worker(session, queue, results, timeout, sem, buf, db_conn))
                for _ in range(WORKERS)]
 
     for item in addrs:
@@ -578,42 +687,37 @@ async def run_verification(session, addrs, timeout):
         await queue.put(None)
     await queue.join()
     await asyncio.gather(*workers, return_exceptions=True)
+    await buf.flush_all()
     return results
 
 
-async def reverify(session, db_conn, only_ok=False, fast=False):
-    q = "SELECT addr, protocol FROM proxies"
-    if only_ok:
-        q += " WHERE ok=1"
-    all_rows = await db_conn.fetch(q)
+async def reverify(session, db_conn, fast=False):
+    total_claimed = 0
+    total_dead = 0
 
-    if not all_rows:
+    while True:
+        rows = await claim_batch(db_conn)
+        if not rows:
+            break
+
+        batch = [(r["addr"], r["protocol"]) for r in rows]
+        total_claimed += len(batch)
+
+        timeout = FAST_TIMEOUT if fast else FULL_TIMEOUT
+        results = await run_verification(session, batch, timeout, db_conn)
+        dead = sum(1 for _, (ok, _) in results if not ok)
+        total_dead += dead
+
+        log.info("claimed batch: %d (dead: %d)", len(batch), dead)
+
+    if total_claimed == 0:
         return
 
-    timeout = FAST_TIMEOUT if fast else FULL_TIMEOUT
+    if total_claimed >= WARMUP_CHECKS and total_dead / total_claimed > ABORT_THRESHOLD:
+        log.error("abort reverify: %.0f%% dead - skipping cleanup", total_dead / total_claimed * 100)
+        return
+
     now = int(time.time())
-    total = len(all_rows)
-
-    log.info("reverify: %d proxies (fast=%s)", total, fast)
-    results = await run_verification(session, [(r["addr"], r["protocol"]) for r in all_rows], timeout)
-
-    dead = sum(1 for _, (ok, _) in results if not ok)
-    if total >= WARMUP_CHECKS and dead / total > ABORT_THRESHOLD:
-        log.error("abort reverify: %.0f%% dead - skipping persist", dead / total * 100)
-        return
-
-    ok_rows, fail_rows = [], []
-    for addr, (ok, lat) in results:
-        if ok:
-            ok_rows.append((lat, now, now, addr))
-        else:
-            fail_rows.append((now, addr))
-
-    for i in range(0, len(ok_rows), BATCH_PERSIST):
-        await db_persist_batch(db_conn, ok_rows[i:i + BATCH_PERSIST], [], now)
-    for i in range(0, len(fail_rows), BATCH_PERSIST):
-        await db_persist_batch(db_conn, [], fail_rows[i:i + BATCH_PERSIST], now)
-
     await db_conn.execute(
         """DELETE FROM proxies
            WHERE score <= -10 AND fail_streak >= 3
@@ -623,7 +727,22 @@ async def reverify(session, db_conn, only_ok=False, fast=False):
 
     alive = await db_conn.fetchval("SELECT COUNT(*) FROM proxies WHERE ok=1")
     tot = await db_conn.fetchval("SELECT COUNT(*) FROM proxies")
-    log.info("reverify: %d/%d alive", alive, tot)
+    log.info("reverify done: %d claimed, %d/%d alive", total_claimed, alive, tot)
+
+
+async def keep_alive_handler(request):
+    return web.json_response({"status": "ok", "instance": INSTANCE_ID, "uptime": time.time()})
+
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get("/keep-alive", keep_alive_handler)
+    app.router.add_get("/", keep_alive_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("http server on port %d", PORT)
 
 
 async def main():
@@ -635,8 +754,13 @@ async def main():
         ttl_dns_cache=300,
     )
     try:
+        await start_http_server()
+
         async with aiohttp.ClientSession(connector=connector) as session:
-            await scrape_all(session, db_conn)
+            if await try_scrape_lock(db_conn):
+                await scrape_all(session, db_conn)
+            else:
+                log.info("scrape skipped: another instance holds the lock")
 
             next_scrape = time.monotonic() + SCRAPE_INTERVAL
             next_fast_reverify = time.monotonic()
@@ -646,15 +770,18 @@ async def main():
                 try:
                     now = time.monotonic()
                     if now >= next_scrape:
-                        await scrape_all(session, db_conn)
+                        if await try_scrape_lock(db_conn):
+                            await scrape_all(session, db_conn)
+                        else:
+                            log.info("scrape skipped: another instance holds the lock")
                         next_scrape = now + SCRAPE_INTERVAL
 
                     if now >= next_fast_reverify:
-                        await reverify(session, db_conn, only_ok=True, fast=True)
+                        await reverify(session, db_conn, fast=True)
                         next_fast_reverify = now + FAST_REVERIFY
 
                     if now >= next_full_reverify:
-                        await reverify(session, db_conn, only_ok=False, fast=False)
+                        await reverify(session, db_conn, fast=False)
                         next_full_reverify = now + REVERIFY_INTERVAL
                 except Exception as e:
                     log.exception("main loop error: %r", e)
